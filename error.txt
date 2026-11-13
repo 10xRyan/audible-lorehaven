@@ -1,0 +1,7 @@
+1. When calculating V4, AI treats every non-joiner as $0 for the whole observation window which understates the effect by ~$2
+2. Claiming "* **These gains are, if anything, conservative.** If being offered has an effect of its own beyond the price, as an ad would, revenue with no offer is lower than the extended curve, and the gains are larger."
+3. Suggesting me to use leakage features
+Panem was in the sample. About 43% of the price information came from comparing the cut regions with Panem. That’s the single-control-region comparison we decided not to rely on, and it contradicted the notebook’s own goal of identifying price from randomized depths. Fitting on the five cut regions only fixes this without extra steps. The price coefficient moves from −0.394 to −0.412.
+The display score was included despite being unreliable. I dropped it.
+Returning ex-members were in the sample with no indicator, so the model under-predicted them (17.6% actual vs 13.9% predicted). I added an ever_member term. The tool needs it, because people who cancel can rejoin. Notebook 2 uses new customers only; that difference is deliberate.
+The out-of-time test sets each test season’s level from that season’s actual joining rate. That’s a fair test of the price slope, not a forecast of the level, and the notebook now says so. I removed the “last year’s season effect” columns.
