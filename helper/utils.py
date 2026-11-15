@@ -21,7 +21,7 @@ import statsmodels.api as sm
 import statsmodels.formula.api as smf
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
-from scipy import optimize, stats
+from scipy import stats
 from scipy.special import expit
 
 SEASONS = {'winter': 0, 'spring': 1, 'summer': 2, 'fall': 3}
@@ -296,9 +296,69 @@ def plot_depth_series(series, title, ylabel='$ per offered customer', colors=Non
 
 
 # ==================================================================================================
-# PART 3: JOINING MODEL
+# PART 3&4: JOINING & CANCELLATION MODEL
 # ==================================================================================================
 def fit_logit(formula, data):
     # Logit with standard errors clustered by customer (a customer appears in several seasons)
     return smf.logit(formula, data=data).fit(disp=0, cov_type='cluster', cov_kwds={'groups': data['customer_id']})
 
+def add_terms_join(x):
+    """Price and exposure terms of the joining model. Used for the data and for tool scenarios."""
+    x = x.copy()
+    x['price_j'] = x['price'] - 12
+    x['price_sq'] = x['price_j'] ** 2
+    x['pod_soc'] = x['pod'] * x['soc']
+    x['sqrt_pod_soc'] = np.sqrt(x['pod_soc'])
+    x['pod_zero'] = x['pod'].eq(0).astype(int)
+    x['soc_zero'] = x['soc'].eq(0).astype(int)
+    return x
+
+def add_terms_cancel(x):
+    """Price and exposure terms of the model, rebuilt from price, price_lag, pod, soc, pod_last and soc_last."""
+    x = x.copy()
+    x['price_c'] = x['price'] - 12                    # centred at today's $12 base, as in the joining model
+    x['price_sq'] = x['price_c'] ** 2
+    x['lag_c'] = x['price_lag'] - 12
+    for a, b, s in [('pod', 'soc', ''), ('pod_last', 'soc_last', '_last')]:
+        x['pod_soc' + s] = x[a] * x[b]
+        x['sqrt_pod_soc' + s] = np.sqrt(x['pod_soc' + s])
+        x['pod_zero' + s] = x[a].eq(0).astype(int)
+        x['soc_zero' + s] = x[b].eq(0).astype(int)
+    return x
+
+
+def price_checks(formula, data, base):
+    """Three checks on the price terms of `formula`: shape, a change at the cut, and the slope by season."""
+    dummies = fit_logit(formula.replace('price_c + price_sq', 'C(price)'), data)
+    lr, dof = 2 * (dummies.llf - base.llf), dummies.df_model - base.df_model
+    print(f"Price dummies vs quadratic: LR = {lr:.1f} on {dof:.0f} df, p = {stats.chi2.sf(lr, dof):.2f}")
+    linear = fit_logit(formula.replace('price_c + price_sq', 'price_c'), data)
+    print(f"Quadratic vs straight line: LR = {2 * (base.llf - linear.llf):.1f} on 1 df")
+    at_cut = fit_logit(formula.replace('price_sq', 'price_sq + price_post'),
+                       data.assign(price_post=data['price_c'] * data['post']))
+    print(f"Separate slope after the cut: {at_cut.params['price_post']:+.3f}, LR = {2 * (at_cut.llf - base.llf):.1f} on 1 df")
+    seasons = sorted(data['t'].unique())
+    slope_terms = [f'price_t{k}' for k in seasons]
+    by_season = data.assign(**{f'price_t{k}': data['price_c'] * data['t'].eq(k) for k in seasons})
+    fit_s = fit_logit(formula.replace('price_c', ' + '.join(slope_terms), 1), by_season)
+    return pd.Series(fit_s.params[slope_terms].to_numpy(), index=[period_label(k) for k in seasons], name='slope at $10')
+
+
+def coef_table_logit(model, terms):
+    """Estimate, CI and p-value for the given terms of a logit (Parts 3 and 4). Separate name: coef_table is Part 1's."""
+    ci = model.conf_int()
+    return pd.DataFrame({'estimate': model.params[terms], 'ci_low': ci.loc[terms, 0], 'ci_high': ci.loc[terms, 1],
+                         'p_value': model.pvalues[terms]}).round(4)
+
+def match_season(target, candidates, log_spend):
+    """The candidate season whose planned podcast and social spend (in logs) is closest to the target season's."""
+    return ((log_spend.loc[candidates] - log_spend.loc[target]) ** 2).sum(axis=1).idxmin()
+
+
+def with_exposure_from(x, season, exposure, add_terms=add_terms_join):
+    """Replace each customer's exposure with their own exposure in `season`, and rebuild the model terms
+    with `add_terms` (add_terms_join for the joining model, add_terms_cancel for the cancellation model)."""
+    past = exposure[exposure['t'].eq(season)].drop(columns='t')
+    x = x.drop(columns=['pod', 'soc']).merge(past, on='customer_id', how='left', validate='one_to_one')
+    assert x[['pod', 'soc']].notna().all().all()
+    return add_terms(x)
