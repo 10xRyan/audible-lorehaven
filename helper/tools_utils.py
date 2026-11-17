@@ -1,10 +1,10 @@
 """Code behind pricing_forecast_tool.ipynb: load the data and the Part 3 / Part 4 models, forecast, report.
 
-The model terms (price centring, exposure terms) are built by utils.add_terms_join and utils.add_terms_cancel,
-the same functions the models were fitted with, so the tool cannot drift from Parts 3 and 4.
+The exposure terms are built by utils.add_terms_join and utils.add_terms_cancel, the same functions the models were
+fitted with. The price terms are written out in `price_effects`: prices are centred at the $12 base, as in Parts 3
+and 4, so if that centring ever changes in utils.py it must change there too.
 """
-import re
-from functools import lru_cache
+from collections import defaultdict
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -19,6 +19,8 @@ HORIZON = 4                                     # the forecast window
 AFTER = 4                                       # four more seasons, run only to show what the window leaves out
 PRICES = np.arange(7, 16)                       # every price the forecast can charge, $7 to $15
 TODAY_OFFER_RATE, TODAY_DEPTHS = 0.25, (1, 2, 3, 4, 5)
+HEAVY = 80                                      # listens x impressions above this = heavy exposure (Part 3)
+AD_BACKDROPS = ('like 2017', 'like 2018', 'like 2019', 'lightest', 'heaviest')
 HARBOR, BRASS, INK, GREY = '#0086a8', '#b8862b', '#14233b', '#7b8798'
 JOIN_EXPOSURE = ['pod', 'soc', 'sqrt_pod_soc', 'pod_soc', 'pod_zero', 'soc_zero']
 CANCEL_EXPOSURE = JOIN_EXPOSURE + [name + '_last' for name in JOIN_EXPOSURE]
@@ -26,7 +28,7 @@ CANCEL_EXPOSURE = JOIN_EXPOSURE + [name + '_last' for name in JOIN_EXPOSURE]
 
 # ---------------------------------------------------------------- pricing policies
 def policy(base, join_discount, offer_rate, member_discount):
-    """One uniform setting for a season: every offered prospect gets `join_discount` off, every member `member_discount` off."""
+    """One uniform setting: every offered prospect gets `join_discount` off, every member `member_discount` off."""
     return dict(base=base, offer_rate=offer_rate, join_depths=(join_discount,), member_depths=(member_discount,))
 
 
@@ -35,192 +37,215 @@ def today_policy(base=12):
     return dict(base=base, offer_rate=TODAY_OFFER_RATE, join_depths=TODAY_DEPTHS, member_depths=TODAY_DEPTHS)
 
 
-# ---------------------------------------------------------------- data and model terms
+# ---------------------------------------------------------------- data and models
 def load_seasons(path=PANEL):
-    """One frame per season for the five cut regions, every frame in the same customer order."""
+    """One frame per season for the five cut regions, every frame in the same customer order, with tenure added."""
     p = u.load_panel(path, extra_cols=('customer_id', 'social_ad_impressions', 'podcast_ad_listen'))
     p = (p[p['region_name'].ne(u.CONTROL)].sort_values(['customer_id', 't'])
          .rename(columns={'podcast_ad_listen': 'pod', 'social_ad_impressions': 'soc'}))
+    # Tenure = consecutive seasons as a member. A new spell starts each time someone joins after not being a member.
     prev = p.groupby('customer_id')['sign_up_flag'].shift(1)
     spell = (p['sign_up_flag'].eq(1) & prev.fillna(0).eq(0)).groupby(p['customer_id']).cumsum()
     p['tenure'] = np.where(p['sign_up_flag'].eq(1), p.groupby(['customer_id', spell]).cumcount() + 1, 0)
-    return {k: g.set_index('customer_id').sort_index() for k, g in p.groupby('t')}
+    return {t: g.set_index('customer_id').sort_index() for t, g in p.groupby('t')}
 
 
-def _value(params, terms, names):
-    """Sum of coefficient x term over `names`."""
+def score(params, terms, names):
+    """Sum of coefficient x term over `names` (one value per row of `terms`)."""
     return sum(params[name] * terms[name].to_numpy(float) for name in names)
 
 
-def _region_index(params, region):
-    out = np.zeros(len(region))
-    for name, beta in params.items():
-        m = re.fullmatch(r'C\(region_name\)\[T\.(.+)\]', name)
-        if m:
-            out += beta * (region == m.group(1))
-    return out
+def region_effect(params, region):
+    """Each customer's region coefficient (0 for the base region)."""
+    return np.array([params.get(f'C(region_name)[T.{r}]', 0.0) for r in region])
 
 
-class Models:
-    """The saved Part 3 and Part 4 coefficients, with the price parts of both models."""
-
-    def __init__(self, join_path=JOIN_PARAMS, cancel_path=CANCEL_PARAMS):
-        self.jp = pd.read_csv(join_path, index_col=0)['coefficient']
-        self.cp = pd.read_csv(cancel_path, index_col=0)['coefficient']
-        self.tenure_fx = np.array([0.0] + [self.cp[f'C(tenure_group)[T.{g}]'] for g in range(2, 9)])   # groups 1 ... 8+
-
-    @lru_cache(maxsize=None)
-    def join_price(self, price):
-        x = u.add_terms_join(pd.DataFrame({'price': [price], 'pod': [0], 'soc': [0]}))
-        return float(_value(self.jp, x, ['price_j', 'price_sq'])[0])
-
-    @lru_cache(maxsize=None)
-    def cancel_price(self, price):
-        return float(_value(self.cp, self._cancel_terms(price, 12), ['price_c', 'price_sq'])[0])
-
-    @lru_cache(maxsize=None)
-    def cancel_lag(self, last_price):
-        return float(_value(self.cp, self._cancel_terms(12, last_price), ['lag_c'])[0])
-
-    @staticmethod
-    def _cancel_terms(price, last_price):
-        zero = [0]
-        return u.add_terms_cancel(pd.DataFrame({'price': [price], 'price_lag': [last_price], 'pod': zero, 'soc': zero,
-                                                'pod_last': zero, 'soc_last': zero}))
+def price_effects(jp, cp):
+    """The price parts of both models (prices centred at the $12 base, as in Parts 3 and 4), for every price."""
+    join = {p: jp['price_j'] * (p - 12) + jp['price_sq'] * (p - 12) ** 2 for p in PRICES}        # this season's price
+    cancel = {p: cp['price_c'] * (p - 12) + cp['price_sq'] * (p - 12) ** 2 for p in PRICES}      # this season's price
+    lag = {p: cp['lag_c'] * (p - 12) for p in PRICES}                                            # last season's price
+    tenure = np.array([0.0] + [cp[f'C(tenure_group)[T.{g}]'] for g in range(2, 9)])        # groups 1 ... 8+
+    return dict(join=join, cancel=cancel, lag=lag, tenure=tenure, offer=jp['offer'])
 
 
-def load(ad_plan=None):
-    """Everything the notebook needs: data, models, and the forecast inputs for the eight seasons after fall 2019.
-
-    The first four are the forecast window; the next four are run only to show what the window leaves out.
-    Advertising repeats 2019 season for season, or, with `ad_plan`, is copied from the past seasons whose planned
-    spend is closest (see `match_ad_plan`). The same seasons are used again for the four seasons after the window.
-    """
+def load(ad_backdrop='like 2019'):
+    # Everything the notebook needs: data, models, and the forecast inputs for the eight seasons after fall
     seasons = load_seasons()
     spend = pd.read_csv(AGGREGATE)
     spend['t'] = (spend['year'] - u.FIRST_YEAR) * 4 + spend['season'].str.lower().map(u.SEASONS)
-    ctx = dict(seasons=seasons, models=Models(), spend=spend.groupby('t')[['podcast_spend', 'social_spend']].first())
+    # order doesn't matter, col name saved as index
+    jp = pd.read_csv(JOIN_PARAMS, index_col=0)['coefficient']
+    cp = pd.read_csv(CANCEL_PARAMS, index_col=0)['coefficient']
     last = max(seasons)                                                     # fall 2019
-    ctx.update(last=last, future=[last + 1 + i for i in range(HORIZON)], n=len(seasons[last]))
     s = seasons[last]
-    ctx['start_members'] = int(s['sign_up_flag'].sum())
-    ctx['start_revenue'] = (s['membership_price'] * s['sign_up_flag']).sum() / ctx['n']
-    ctx['ad_seasons'] = [k - 4 for k in ctx['future']] if ad_plan is None else match_ad_plan(ctx, ad_plan)
-    ctx['inputs'] = prepare(ctx, last, ctx['ad_seasons'] * 2)
+    ctx = dict(seasons=seasons, jp=jp, cp=cp, price=price_effects(jp, cp),
+               spend=spend.groupby('t')[['podcast_spend', 'social_spend']].first(),
+               heavy=pd.Series({t: (x['pod'] * x['soc'] > HEAVY).mean() for t, x in seasons.items()}),
+               last=last, future=[last + 1 + i for i in range(HORIZON)], n=len(s),
+               start_members=int(s['sign_up_flag'].sum()),
+               start_revenue=(s['membership_price'] * s['sign_up_flag']).sum() / len(s))
+    ctx['ad_seasons'] = pick_ad_seasons(ctx, ad_backdrop)
+    ctx['inputs'] = prepare(ctx, ctx['ad_seasons'] * 2)                     # the same backdrop for the extra four
     ctx['today'] = forecast(ctx, ctx['inputs'], [today_policy()] * (HORIZON + AFTER))
-    ctx['backtest_gap'] = _backtest_record(ctx)[1]                          # how far off levels ran on 2019
     print(f"Ready: {ctx['n']:,} customers in five regions, {ctx['start_members']:,} of them members in "
           f"{u.period_label(last)}.")
+    print(f"Advertising backdrop '{ad_backdrop}': ads copied from "
+          + ', '.join(u.period_label(t) for t in ctx['ad_seasons']) + '.')
     return ctx
 
 
-def match_ad_plan(ctx, ad_plan):
-    """Advanced option. For each forecast season, the past season at the same time of year whose planned podcast and
-    social spend is closest to the plan (in logs). Its customers' exposure is then copied.
+def pick_ad_seasons(ctx, choice):
+    """For each forecast season, the past season at the same time of year whose ad exposure stands in for it.
 
-    This changes the advertising backdrop for every pricing setting alike. It is not a spend lever: exposure was not
-    randomized, so a difference between two ad plans is not the return on ad spend.
+    'like 2017' / 'like 2018' / 'like 2019': that year, season for season.
+    'lightest' / 'heaviest': the past season with the smallest / largest share of heavily exposed customers.
+    A backdrop, not a spend lever: exposure was not randomized, so a gap between backdrops is not the return on ads.
     """
-    spend, future = ctx['spend'], ctx['future']
-    if len(ad_plan) != len(future) or any(len(pair) != 2 for pair in ad_plan):
-        raise ValueError('AD_PLAN must be four (podcast, social) pairs: winter, spring, summer and fall.')
-    low, high = spend.min(), spend.max()
-    problems, matched = [], []
-    for k, (podcast, social) in zip(future, ad_plan):
-        if not (low['podcast_spend'] <= podcast <= high['podcast_spend'] and low['social_spend'] <= social <= high['social_spend']):
-            problems.append(f"{u.period_label(k)}: ({podcast}, {social}) is outside the planned spend ever seen "
-                            f"(podcast {low['podcast_spend']}-{high['podcast_spend']}, social {low['social_spend']}-{high['social_spend']}).")
-            continue
-        same_time = [t for t in spend.index if t % 4 == k % 4]
-        distance = ((np.log(spend.loc[same_time]) - np.log([podcast, social])) ** 2).sum(axis=1)
-        matched.append(int(distance.idxmin()))
-    if problems:
-        raise ValueError('Please change AD_PLAN at the top:\n  ' + '\n  '.join(problems))
-    print('Advanced option: ad exposure copied from the past season at the same time of year with the closest planned spend.')
-    for k, (podcast, social), m in zip(future, ad_plan, matched):
-        print(f"  {u.period_label(k)}: your plan ({podcast}, {social}) -> {u.period_label(m)} "
-              f"(planned {spend.loc[m, 'podcast_spend']}, {spend.loc[m, 'social_spend']})")
-    print("This changes the advertising backdrop for every setting alike. Differences between two ad plans are not the "
-          "return on ad spend: exposure was not randomized.\n")
-    return matched
+    if choice not in AD_BACKDROPS:
+        raise ValueError(f"AD_BACKDROP must be one of {', '.join(repr(c) for c in AD_BACKDROPS)}.")
+    if choice.startswith('like '):
+        year = int(choice[5:]) - u.FIRST_YEAR
+        return [4 * year + t % 4 for t in ctx['future']]
+    heavy = ctx['heavy']
+    same_time = [heavy[heavy.index % 4 == t % 4] for t in ctx['future']]
+    return [int(h.idxmin() if choice == 'lightest' else h.idxmax()) for h in same_time]
 
 
-def prepare(ctx, start, matched):
+def ad_menu(ctx):
+    """Each past season's advertising, so a backdrop can be chosen. Marks the seasons the current backdrop uses."""
+    order = sorted(ctx['heavy'].index, key=lambda t: (t % 4, t))           # by time of year, then year
+    heavy = ctx['heavy'][order]
+    table = pd.DataFrame({
+        'Time of year': [u.period_label(t).split()[0] for t in order],
+        'Year': [u.FIRST_YEAR + t // 4 for t in order],
+        'Podcast spend (planned)': ctx['spend'].loc[order, 'podcast_spend'].to_numpy(),
+        'Social spend (planned)': ctx['spend'].loc[order, 'social_spend'].to_numpy(),
+        'Customers heavily exposed': heavy.to_numpy(),
+        'Ad level': ['Light' if x < 0.05 else 'Heavy' if x >= 0.15 else 'Typical' for x in heavy],
+        'Used now': ['yes' if t in ctx['ad_seasons'] else '' for t in order],
+    }).set_index(['Time of year', 'Year'])
+    return table.style.format({'Customers heavily exposed': '{:.0%}'.format})
+
+
+def prepare(ctx, ad_seasons):
     """Everything about each customer that does not depend on the pricing choices.
 
-    start: last observed season. matched: for each forecast season, the past season whose ad exposure stands in for it.
+    ad_seasons: for each forecast season, the past season whose exposure stands in for it.
+    Returns, per forecast season, each customer's join and cancel log-odds before the price terms.
     """
-    seasons, m = ctx['seasons'], ctx['models']
-    s0 = seasons[start]
+    seasons, jp, cp = ctx['seasons'], ctx['jp'], ctx['cp']
+    s0 = seasons[ctx['last']]                                                # fall 2019, the last real season
     region = s0['region_name'].to_numpy()
     join_index, cancel_index = [], []
     last = s0[['pod', 'soc']].to_numpy(float)                                # last observed season: real exposure
-    for k in matched:
-        this = seasons[k][['pod', 'soc']].to_numpy(float)
+    for t in ad_seasons:
+        this = seasons[t][['pod', 'soc']].to_numpy(float)
         x = pd.DataFrame({'pod': this[:, 0], 'soc': this[:, 1], 'pod_last': last[:, 0], 'soc_last': last[:, 1],
                           'price': 12, 'price_lag': 12})
-        join_index.append(m.jp['Intercept'] + _region_index(m.jp, region) + _value(m.jp, u.add_terms_join(x), JOIN_EXPOSURE))
-        cancel_index.append(m.cp['Intercept'] + _region_index(m.cp, region)
-                            + _value(m.cp, u.add_terms_cancel(x), CANCEL_EXPOSURE))
+        join_index.append(jp['Intercept'] + region_effect(jp, region) + score(jp, u.add_terms_join(x), JOIN_EXPOSURE))
+        cancel_index.append(cp['Intercept'] + region_effect(cp, region)
+                            + score(cp, u.add_terms_cancel(x), CANCEL_EXPOSURE))
         last = this                                                          # the next season looks back at this one
-    member = s0['sign_up_flag'].to_numpy().astype(bool)
-    return dict(join_index=join_index, cancel_index=cancel_index, member=member, n=len(s0),
+    return dict(join_index=join_index, cancel_index=cancel_index, member=s0['sign_up_flag'].to_numpy().astype(bool),
                 tenure=np.clip(s0['tenure'].to_numpy(), 1, 8), last_price=s0['membership_price'].to_numpy().astype(int))
 
 
 # ---------------------------------------------------------------- forecast
 def forecast(ctx, inp, policies):
-    """Roll forward one season at a time; one policy per season (see `policy` and `today_policy`).
+    """Roll forward one season at a time; one setting per season (see `policy` and `today_policy`).
 
     Each customer carries the probability of being a non-member, or a member with a given tenure (1 ... 8+ seasons)
     and a given last price. The last price matters because the cancellation model uses it, and under today's policy it
     differs from member to member. Each season starts from the season before.
     """
-    m, n = ctx['models'], inp['n']
-    member = inp['member']
-    state = np.zeros((8, len(PRICES), n))                                    # [tenure group, last price, customer]
-    idx = np.where(member)[0]
-    state[inp['tenure'][idx] - 1, inp['last_price'][idx] - PRICES[0], idx] = 1.0
-    p_out = (~member).astype(float)
-    rows = []
-    for s, pol in enumerate(policies):
-        base, rate = pol['base'], pol['offer_rate']
-        new = np.zeros_like(state)
-        stay, cancel, joined, revenue = (np.zeros(n) for _ in range(4))
+    n = ctx['n']
+    price = ctx['price']
 
-        # Members: cancel or stay at this season's member price, then move up one tenure group
-        w = 1 / len(pol['member_depths'])
-        for g in range(8):
-            for j, last_price in enumerate(PRICES):
-                here = state[g, j]
-                if not here.any():
-                    continue
-                index = inp['cancel_index'][s] + m.tenure_fx[g] + m.cancel_lag(int(last_price))
-                for depth in pol['member_depths']:
-                    price = base - depth
-                    c = expit(index + m.cancel_price(price))
-                    kept = here * w * (1 - c)
-                    new[min(g + 1, 7), price - PRICES[0]] += kept
-                    stay += kept
-                    cancel += here * w * c
-                    revenue += kept * price
+    # Initial non-member probabilities
+    non_member = (~inp['member']).astype(float)
 
-        # Non-members: join on an offer (at each offered depth) or at the base price
-        offers = [(rate / len(pol['join_depths']), base - d, 1) for d in pol['join_depths']] + [(1 - rate, base, 0)]
-        for share, price, offered in offers:
-            p = expit(inp['join_index'][s] + m.join_price(price) + m.jp['offer'] * offered)
-            j = p_out * share * p
-            new[0, price - PRICES[0]] += j
-            joined += j
-            revenue += j * price
+    # Initial member states: (tenure, last_price) -> each customer's probability of being in that state.
+    # defaultdict creates an empty array the first time a new state is used.
+    members = defaultdict(lambda: np.zeros(n))
+    for i in np.where(inp['member'])[0]:
+        tenure = int(inp['tenure'][i])
+        last_price = int(inp['last_price'][i])
+        members[(tenure, last_price)][i] = 1.0
 
-        p_out = p_out - joined + cancel
-        state = new
-        rows.append({'members': (stay + joined).sum(), 'joined': joined.sum(), 'cancelled': cancel.sum(),
-                     'revenue': revenue.sum()})
-    out = pd.DataFrame(rows)
-    out['revenue per customer'] = out['revenue'] / n
-    return out
+    results = []
+    for season, setting in enumerate(policies):
+        # initialization for each simulated season
+        next_members = defaultdict(lambda: np.zeros(n))
+        joined = np.zeros(n)
+        cancelled = np.zeros(n)
+        stayed = np.zeros(n)
+        revenue = np.zeros(n)
+        discount_weight = 1 / len(setting['member_depths'])            # each member discount equally likely
+
+        # STEP 1: Existing members stay or cancel
+        for (tenure, last_price), prob in members.items():
+            for discount in setting['member_depths']:
+                current_price = setting['base'] - discount
+                log_odds = (
+                    inp['cancel_index'][season]
+                    + price['tenure'][tenure - 1]
+                    + price['lag'][last_price]
+                    + price['cancel'][current_price]
+                )
+                p_cancel = expit(log_odds)
+
+                p_stay = prob * discount_weight * (1 - p_cancel)
+                p_churn = prob * discount_weight * p_cancel
+
+                next_tenure = min(tenure + 1, 8)                        # 8 = 8 or more seasons
+                next_members[(next_tenure, current_price)] += p_stay
+
+                stayed += p_stay
+                cancelled += p_churn
+                revenue += p_stay * current_price
+
+        # STEP 2: Non-members join, with an offer or at the base price
+        offers = [
+            (setting['offer_rate'] / len(setting['join_depths']), setting['base'] - d, 1)
+            for d in setting['join_depths']
+        ]
+        offers.append((1 - setting['offer_rate'], setting['base'], 0))
+
+        for share, current_price, offered in offers:
+            log_odds = (
+                inp['join_index'][season]
+                + price['join'][current_price]
+                + price['offer'] * offered
+            )
+            p_join = expit(log_odds)
+            new_joiners = non_member * share * p_join
+
+            next_members[(1, current_price)] += new_joiners
+
+            joined += new_joiners
+            revenue += new_joiners * current_price
+
+        # STEP 3: Update customer states (cancellers can rejoin from next season)
+        non_member = non_member - joined + cancelled
+        members = next_members
+
+        # STEP 4: Save results
+        results.append({
+            'members': (stayed + joined).sum(),
+            'joined': joined.sum(),
+            'cancelled': cancelled.sum(),
+            'revenue': revenue.sum(),
+            'revenue per customer': revenue.sum() / n,
+        })
+
+    return pd.DataFrame(results)
+
+
+def summarize(run):
+    """Revenue per customer over the window and over the four seasons after it, and members at the end of the window."""
+    return {'revenue': run['revenue per customer'].iloc[:HORIZON].sum(), 'members': run['members'].iloc[HORIZON - 1],
+            'revenue_after': run['revenue per customer'].iloc[HORIZON:].sum()}
 
 
 # ---------------------------------------------------------------- the notebook's outputs
@@ -237,25 +262,22 @@ def run(ctx, base, join_discount, share_offered, member_discount):
         raise ValueError('Please change the pricing choices at the top:\n  ' + '\n  '.join(problems))
 
     mine = forecast(ctx, ctx['inputs'], [policy(base, join_discount, share_offered / 100, member_discount)] * (HORIZON + AFTER))
-    window, after = summarize(mine), summarize(ctx['today'])
-    word = lambda x, up, down: up if x > 0 else down
+    window, today = summarize(mine), summarize(ctx['today'])
+    more = lambda x: 'more' if x > 0 else 'less'
     pct = lambda a, b: 100 * (a / b - 1)
+    gap, member_gap = window['revenue'] - today['revenue'], window['members'] - today['members']
+    later_gap = window['revenue_after'] - today['revenue_after']
     print(f"Your choices: ${base} base price; ${join_discount} off the first season for {share_offered}% of non-members "
           f"(they pay ${join_price}); ${member_discount} off for members (they pay ${member_price}).\n")
     print(f"Over the next four seasons each customer brings in ${window['revenue']:.2f},")
     print(f"and {window['members']:,.0f} are members by {u.period_label(ctx['future'][-1])}.\n")
-    gap, member_gap = window['revenue'] - after['revenue'], window['members'] - after['members']
     print(f"Compared with today's policy (a random $1-$5 off, re-drawn every season): ${abs(gap):.2f} "
-          f"{word(gap, 'more', 'less')} per customer ({pct(window['revenue'], after['revenue']):+.1f}%), "
-          f"and {abs(member_gap):,.0f} {word(member_gap, 'more', 'fewer')} members.")
-    print(f"In total: ${window['revenue'] * ctx['n']:,.0f} against ${after['revenue'] * ctx['n']:,.0f}.\n")
-    later_gap = window['revenue_after'] - after['revenue_after']
-    print(f"The four seasons after that, if nothing changes: ${abs(later_gap):.2f} {word(later_gap, 'more', 'less')} per "
-          f"customer than today's policy ({pct(window['revenue_after'], after['revenue_after']):+.1f}%). This shows whether "
+          f"{more(gap)} per customer ({pct(window['revenue'], today['revenue']):+.1f}%), "
+          f"and {abs(member_gap):,.0f} {'more' if member_gap > 0 else 'fewer'} members.")
+    print(f"In total: ${window['revenue'] * ctx['n']:,.0f} against ${today['revenue'] * ctx['n']:,.0f}.\n")
+    print(f"The four seasons after that, if nothing changes: ${abs(later_gap):.2f} {more(later_gap)} per "
+          f"customer than today's policy ({pct(window['revenue_after'], today['revenue_after']):+.1f}%). This shows whether "
           f"the lead holds once the member base has adjusted.")
-    lean = ctx['backtest_gap']
-    print(f"In the back-test, levels ran {abs(lean):.0%} {word(lean, 'high', 'low')}; the difference from today's policy "
-          f"is the more reliable number.")
 
     notes = []
     if member_price >= 15: notes.append('No member has ever been charged $15, so the member side goes one dollar beyond the data.')
@@ -266,29 +288,19 @@ def run(ctx, base, join_discount, share_offered, member_discount):
     return mine
 
 
-def summarize(run):
-    """Revenue per customer over the window and over the four seasons after it, and members at the end of the window."""
-    return {'revenue': run['revenue per customer'].iloc[:HORIZON].sum(), 'members': run['members'].iloc[HORIZON - 1],
-            'revenue_after': run['revenue per customer'].iloc[HORIZON:].sum()}
-
-
-def _grid(ctx, inputs, base, share_offered, seasons):
-    """Every joining and member discount (prices of $7 or more), each forecast for `seasons` seasons."""
-    for join_discount in range(6):
-        for member_discount in range(6):
-            if min(base - join_discount, base - member_discount) >= 7:
-                setting = policy(base, join_discount, share_offered / 100, member_discount)
-                yield join_discount, member_discount, summarize(forecast(ctx, inputs, [setting] * seasons))
-
-
 def best_settings(ctx, base, share_offered, top=10):
     """Every joining and member discount at the given base price and offer share, ranked by four-season revenue."""
     today = summarize(ctx['today'])
-    rows = [{'Joining discount': j, 'Member discount': m, 'Revenue per customer, 4 seasons': run['revenue'],
-             'vs today': run['revenue'] / today['revenue'] - 1,
-             'Members at the end': run['members'], 'Members vs today': run['members'] - today['members'],
-             'Next 4 seasons, vs today': run['revenue_after'] / today['revenue_after'] - 1}
-            for j, m, run in _grid(ctx, ctx['inputs'], base, share_offered, HORIZON + AFTER)]
+    rows = []
+    for j in range(6):
+        for m in range(6):
+            if min(base - j, base - m) < 7:
+                continue
+            run = summarize(forecast(ctx, ctx['inputs'], [policy(base, j, share_offered / 100, m)] * (HORIZON + AFTER)))
+            rows.append({'Joining discount': j, 'Member discount': m, 'Revenue per customer, 4 seasons': run['revenue'],
+                         'vs today': run['revenue'] / today['revenue'] - 1,
+                         'Members at the end': run['members'], 'Members vs today': run['members'] - today['members'],
+                         'Next 4 seasons, vs today': run['revenue_after'] / today['revenue_after'] - 1})
     table = (pd.DataFrame(rows).sort_values('Revenue per customer, 4 seasons', ascending=False).head(top)
              .reset_index(drop=True))
     table.index = table.index + 1
@@ -300,49 +312,19 @@ def best_settings(ctx, base, share_offered, top=10):
                                'Next 4 seasons, vs today': '{:+.1%}'.format})
 
 
-def robustness(ctx, base, share_offered, top=8):
-    """The settings ranking with advertising copied from each past year in turn (2017, 2018, 2019).
-
-    If the same settings stay on top in every year, the pricing advice does not hinge on the marketing assumption.
-    """
-    seasons, spend = ctx['seasons'], ctx['spend']
-    columns, winners = {}, []
-    for year in sorted({t // 4 for t in seasons}):
-        ad_seasons = [4 * year + k % 4 for k in ctx['future']]
-        inputs = prepare(ctx, ctx['last'], ad_seasons)
-        today = summarize(forecast(ctx, inputs, [today_policy()] * HORIZON))
-        label = (f"{u.FIRST_YEAR + year} ads (podcast {spend.loc[ad_seasons, 'podcast_spend'].sum()}, "
-                 f"social {spend.loc[ad_seasons, 'social_spend'].sum()})")
-        columns[label] = pd.Series({(j, m): run['revenue'] / today['revenue'] - 1
-                                    for j, m, run in _grid(ctx, inputs, base, share_offered, HORIZON)})
-        best = columns[label].idxmax()
-        winners.append(f"{u.FIRST_YEAR + year}: ${best[0]} to join, ${best[1]} for members")
-    table = pd.DataFrame(columns)
-    table['Average'] = table.mean(axis=1)
-    ranks = table.drop(columns='Average').rank(ascending=False).astype(int)
-    table['Worst rank'] = ranks.max(axis=1)
-    table = table.sort_values('Average', ascending=False).head(top)
-    table.index = [f'${j} to join, ${m} for members' for j, m in table.index]
-    print(f"Four-season revenue per customer against today's policy, at a ${base} base with {share_offered}% offered, "
-          f"under each past year's advertising.\nBest setting: " + '; '.join(winners) + '.')
-    return table.style.format({c: '{:+.1%}'.format for c in table.columns if c != 'Worst rank'})
-
-
 def season_table(ctx, mine):
     """Season-by-season table for the chosen settings, with today's policy alongside."""
-    mine, today, n = mine.iloc[:HORIZON], ctx['today'].iloc[:HORIZON], ctx['n']
-    table = pd.DataFrame({'Season': [u.period_label(k) for k in ctx['future']], 'Members': mine['members'],
-                          'Joined': mine['joined'], 'Cancelled': mine['cancelled'],
-                          'Revenue per customer': mine['revenue per customer'], 'Total revenue': mine['revenue'],
-                          "Members, today's policy": today['members'],
-                          "Revenue per customer, today's policy": today['revenue per customer']})
-    first = {'Season': u.period_label(ctx['last']) + ' (actual)', 'Members': ctx['start_members'],
-             'Revenue per customer': ctx['start_revenue'], 'Total revenue': ctx['start_revenue'] * n,
-             "Members, today's policy": ctx['start_members'], "Revenue per customer, today's policy": ctx['start_revenue']}
-    totals = {'Season': 'Four seasons', 'Joined': mine['joined'].sum(), 'Cancelled': mine['cancelled'].sum(),
-              'Revenue per customer': mine['revenue per customer'].sum(), 'Total revenue': mine['revenue'].sum(),
-              "Revenue per customer, today's policy": today['revenue per customer'].sum()}
-    table = pd.concat([pd.DataFrame([first]), table, pd.DataFrame([totals])], ignore_index=True)[table.columns].set_index('Season')
+    mine, today = mine.iloc[:HORIZON], ctx['today'].iloc[:HORIZON]
+    columns = ['Season', 'Members', 'Joined', 'Cancelled', 'Revenue per customer', 'Total revenue',
+               "Members, today's policy", "Revenue per customer, today's policy"]
+    rows = [[u.period_label(ctx['last']) + ' (actual)', ctx['start_members'], None, None, ctx['start_revenue'],
+             ctx['start_revenue'] * ctx['n'], ctx['start_members'], ctx['start_revenue']]]
+    for t, (_, m), (_, d) in zip(ctx['future'], mine.iterrows(), today.iterrows()):
+        rows.append([u.period_label(t), m['members'], m['joined'], m['cancelled'], m['revenue per customer'],
+                     m['revenue'], d['members'], d['revenue per customer']])
+    rows.append(['Four seasons', None, mine['joined'].sum(), mine['cancelled'].sum(), mine['revenue per customer'].sum(),
+                 mine['revenue'].sum(), None, today['revenue per customer'].sum()])
+    table = pd.DataFrame(rows, columns=columns).set_index('Season')
     money, whole = '${:,.2f}'.format, '{:,.0f}'.format
     return table.style.format({'Members': whole, 'Joined': whole, 'Cancelled': whole, 'Revenue per customer': money,
                                'Total revenue': '${:,.0f}'.format, "Members, today's policy": whole,
@@ -352,8 +334,7 @@ def season_table(ctx, mine):
 def plot(ctx, mine):
     """Members at the end of each season, and revenue per customer, for the chosen settings against today's policy."""
     mine, today = mine.iloc[:HORIZON], ctx['today'].iloc[:HORIZON]
-    short = lambda k: u.period_label(k)
-    names = [short(k) for k in [ctx['last'], *ctx['future']]]
+    names = [u.period_label(t) for t in [ctx['last'], *ctx['future']]]
     fig, (left, right) = plt.subplots(1, 2, figsize=(12, 4.2))
 
     mine_m = np.r_[ctx['start_members'], mine['members']] / 1000
@@ -362,7 +343,7 @@ def plot(ctx, mine):
     left.plot(names, mine_m, color=HARBOR, lw=2.5, marker='o', ms=7, mec='white', mew=1.5, label='Your settings')
     left.annotate(f'{mine_m[-1]:,.0f}k', (4, mine_m[-1]), xytext=(9, 0), textcoords='offset points', va='center',
                   color=INK, weight='bold')
-    if abs(mine_m[-1] - today_m[-1]) > 0.04 * max(mine_m.max(), today_m.max()):
+    if abs(mine_m[-1] - today_m[-1]) > 0.04 * max(mine_m.max(), today_m.max()):       # label today's only if apart
         left.annotate(f'{today_m[-1]:,.0f}k', (4, today_m[-1]), xytext=(9, 0), textcoords='offset points', va='center',
                       color=GREY)
     left.set_xlim(-0.3, 4.6)
@@ -386,38 +367,3 @@ def plot(ctx, mine):
         ax.legend(frameon=False, loc='upper left', bbox_to_anchor=(0, -0.2), ncols=2)
     fig.tight_layout()
     plt.show()
-
-
-def backtest(ctx):
-    """The back-test table, with a two-line summary."""
-    record, gap = _backtest_record(ctx)
-    member_gap = 100 * (record['Members, forecast'] - record['Members, actual']) / ctx['n']
-    print(f"Four-season revenue per customer: ${record['Revenue per customer, forecast'].sum():.2f} forecast against "
-          f"${record['Revenue per customer, actual'].sum():.2f} actual ({100 * gap:+.0f}%).")
-    print(f"Members: off by {member_gap.min():+.1f} to {member_gap.max():+.1f} per 100 customers.")
-    money, whole = '${:,.2f}'.format, '{:,.0f}'.format
-    return record.style.format({'Members, actual': whole, 'Members, forecast': whole,
-                                'Revenue per customer, actual': money, 'Revenue per customer, forecast': money})
-
-
-def _backtest_record(ctx):
-    """The same method started at the end of fall 2018 and asked to forecast 2019 under 2019's actual policy.
-
-    It is given the 2019 prices (today's random discounts, with the $15 base until the cut). Advertising is taken
-    from the same season a year earlier, exactly as the forecast takes 2019's. Nothing else from 2019 is used.
-    Returns the season table and the four-season revenue gap (forecast / actual - 1).
-    """
-    seasons, n = ctx['seasons'], ctx['n']
-    start = ctx['last'] - 4
-    future = [start + 1 + i for i in range(HORIZON)]
-    matched = [k - 4 for k in future]
-    bt = forecast(ctx, prepare(ctx, start, matched), [today_policy(15 if k < u.CUT_T else 12) for k in future])
-    record = pd.DataFrame({'Season': [u.period_label(k) for k in future],
-                           'Ad exposure taken from': [u.period_label(k) for k in matched],
-                           'Members, actual': [seasons[k]['sign_up_flag'].sum() for k in future],
-                           'Members, forecast': bt['members'].round(),
-                           'Revenue per customer, actual': [(seasons[k]['membership_price'] * seasons[k]['sign_up_flag']).sum() / n
-                                                            for k in future],
-                           'Revenue per customer, forecast': bt['revenue per customer']}).set_index('Season')
-    gap = record['Revenue per customer, forecast'].sum() / record['Revenue per customer, actual'].sum() - 1
-    return record, gap

@@ -3,8 +3,8 @@
 The notebooks run every step themselves. This file only holds the pieces that would otherwise
 be copied for each metric or analysis.
 
-Part 1 (01_price_cut.ipynb): region-season cells, the WLS regression, coefficients, the
-historical band, and the event-study / placebo plots.
+Part 1 (01_price_cut.ipynb): region-season cells, the WLS regression, coefficients, and the
+levels / placebo plots.
 Part 2 (02_promotion.ipynb): the LTV regression, regression-adjusted means by discount depth,
 and one plot.
 Part 3 (03_modeling.ipynb): the joining logit (design matrix, fit, predictions), calibration
@@ -19,8 +19,6 @@ import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 import statsmodels.formula.api as smf
-from matplotlib.lines import Line2D
-from matplotlib.patches import Patch
 from scipy import stats
 from scipy.special import expit
 
@@ -28,7 +26,6 @@ SEASONS = {'winter': 0, 'spring': 1, 'summer': 2, 'fall': 3}
 SEASON_ABBR = ['Win', 'Spr', 'Sum', 'Fall']
 FIRST_YEAR = 2017
 #  t runs from 0 (winter 2017) to 11 (fall 2019).
-REF_T = 8          # winter 2019: last season before the cut, event-study reference
 CUT_T = 9          # spring 2019: first season at the $12 base price
 CONTROL = 'panem'  # the only region that kept $15
 
@@ -41,7 +38,6 @@ METRICS = {
 # Chart palette (same as the EDA notebooks): blue = cut regions, orange = panem
 TREATED_C, CONTROL_C, THIRD_C = '#2a78d6', '#eb6834', '#1baf7a'
 INK, INK2, MUTED, GRID, AXIS, SURFACE = '#0b0b0b', '#52514e', '#898781', '#e1e0d9', '#c3c2b7', '#fcfcfb'
-BAND_C = '#e4e3dc'
 
 def period_label(t, short=False):
     # t -> 'Win 2019'. short=True gives a two-line tick label for winters and the season name elsewhere
@@ -95,38 +91,6 @@ def coef_table(fit, terms, level=0.95):
                          'ci_low': ci[0], 'ci_high': ci[1], 'p_value': fit.pvalues[terms]})
 
 
-def event_points(fit, periods, ref=REF_T):
-    """Event-study points from a fit with ev_<k> terms, plus the reference season fixed at 0."""
-    tab = coef_table(fit, [f'ev_{k}' for k in periods if k != ref])
-    tab.loc[f'ev_{ref}'] = [0.0, 0.0, 0.0, 0.0, np.nan]
-    tab['t'] = [int(name.split('_')[1]) for name in tab.index]
-    tab = tab.sort_values('t').reset_index(drop=True)
-    tab.insert(0, 'season', tab['t'].map(period_label))
-    tab['post'] = tab['t'].ge(CUT_T)
-    tab['is_ref'] = tab['t'].eq(ref)
-    return tab
-
-
-def historical_band(points, level=0.95):
-    """Band from the season-to-season spread of the pre-cut points (the reference season's 0 included).
-
-    half_width     : one new season, center ± t * sd * sqrt(1 + 1/n_pre)
-    half_width_avg : post-cut average minus pre-cut average, ± t * sd * sqrt(1/n_post + 1/n_pre)
-    """
-    pre = points.loc[points['t'].lt(CUT_T), 'estimate']
-    post = points.loc[points['t'].ge(CUT_T), 'estimate']
-    n_pre, n_post = len(pre), len(post)
-    sd = pre.std(ddof=1)
-    t_crit = stats.t.ppf(0.5 + level / 2, df=n_pre - 1)
-    return pd.Series({
-        'n_pre': n_pre, 'n_post': n_post, 'sd': sd, 't_crit': t_crit,
-        'center': pre.mean(),
-        'half_width': t_crit * sd * np.sqrt(1 + 1 / n_pre),
-        'post_avg_gap': post.mean() - pre.mean(),
-        'half_width_avg': t_crit * sd * np.sqrt(1 / n_post + 1 / n_pre),
-    })
-
-
 # ---------------------------------------------------------------- plots
 def apply_style():
     plt.rcParams.update({
@@ -168,43 +132,6 @@ def plot_levels(cells, y, ax=None):
     return ax
 
 
-def plot_event_study(points, band, y, compare=None, ax=None):
-    """Gap vs panem relative to the reference season, with the historical band and model CIs.
-
-    compare: optional second set of points (e.g. without the Westeros adjustment), drawn hollow.
-    """
-    ax = ax or plt.subplots(figsize=(8, 4.2))[1]
-    x, est, ref = points['t'].to_numpy(), points['estimate'].to_numpy(), points['is_ref'].to_numpy()
-
-    ax.axhspan(band['center'] - band['half_width'], band['center'] + band['half_width'], color=BAND_C, lw=0, zorder=0)
-    ax.axhline(band['center'], color=MUTED, lw=1, ls=':', zorder=1)
-    ax.axhline(0, color=AXIS, lw=1, zorder=1)
-    yerr = np.vstack([est - points['ci_low'], points['ci_high'] - est])[:, ~ref]
-    ax.errorbar(x[~ref], est[~ref], yerr=yerr, fmt='none', ecolor=TREATED_C, elinewidth=1.2, alpha=0.45, zorder=2)
-    ax.plot(x, est, color=TREATED_C, lw=1.5, zorder=2)
-    ax.scatter(x[~ref], est[~ref], s=42, color=TREATED_C, edgecolor=SURFACE, linewidth=1.5, zorder=3)
-    ax.scatter(x[ref], est[ref], s=42, facecolor=SURFACE, edgecolor=TREATED_C, linewidth=1.5, zorder=3)
-    if compare is not None:
-        ax.scatter(compare['t'] + 0.18, compare['estimate'], s=20, facecolor='none', edgecolor=INK2, linewidth=1, zorder=3)
-
-    mark_cut(ax)
-    _period_axis(ax, x)
-    ax.set_ylabel(METRICS[y]['unit'])
-    ax.set_title(f"{METRICS[y]['label']}: cut regions minus panem, relative to {period_label(REF_T)}")
-    handles = [
-        Line2D([], [], color=TREATED_C, marker='o', ms=6, mec=SURFACE, label='gap vs panem (relative to reference)'),
-        Line2D([], [], color=TREATED_C, marker='o', ms=6, mfc=SURFACE, ls='none', label='reference season (= 0)'),
-        Line2D([], [], color=TREATED_C, alpha=0.45, lw=1.2, label='model-based 95% CI (diagnostic)'),
-        Patch(color=BAND_C, label='historical-gap band (95%, pre-cut)'),
-        Line2D([], [], color=MUTED, lw=1, ls=':', label='pre-cut average gap'),
-    ]
-    if compare is not None:
-        handles.append(Line2D([], [], color=INK2, marker='o', ms=5, mfc='none', ls='none',
-                              label='without Westeros adjustment'))
-    ax.legend(handles=handles, loc='upper center', bbox_to_anchor=(0.5, -0.16), ncol=2)
-    return ax
-
-
 def plot_placebos(placebo, did, y, ax=None):
     """Placebo DiDs next to the real DiD. Filled = with the Westeros adjustment, hollow = without.
 
@@ -242,8 +169,10 @@ def plot_placebos(placebo, did, y, ax=None):
 # ==================================================================================================
 # PART 2: PROMOTION LTV
 # ==================================================================================================
-def fit_ltv(data, y, fixed_effects=True):
-    # OLS of LTV on discount depth (categorical, $1 off is the base), SEs clustered by customer
+def fit_ltv(data, y, fixed_effects=False):
+    # LTV on discount depth ($1 off is the base), SEs clustered by customer.
+    # Depth is randomized, so by default this is depth-only: the coefficients are differences of raw means,
+    # and the regression only attaches confidence intervals. fixed_effects=True is a robustness check.
     rhs = 'C(depth)' + (' + C(region_name) + C(t)' if fixed_effects else '')
     return smf.ols(f'{y} ~ {rhs}', data=data).fit(cov_type='cluster', cov_kwds={'groups': data['customer_id']})
 
