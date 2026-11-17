@@ -1,26 +1,8 @@
-"""Small helpers for the Lorehaven notebooks.
-
-The notebooks run every step themselves. This file only holds the pieces that would otherwise
-be copied for each metric or analysis.
-
-Part 1 (01_price_cut.ipynb): region-season cells, the WLS regression, coefficients, and the
-levels / placebo plots.
-Part 2 (02_promotion.ipynb): the LTV regression, regression-adjusted means by discount depth,
-and one plot.
-Part 3 (03_modeling.ipynb): the joining logit (design matrix, fit, predictions), calibration
-tables, the intercept shift for unseen seasons, and the average joining curve by price.
-
-Periods are integers t = 0 (winter 2017) ... 11 (fall 2019).
-"""
-from dataclasses import dataclass
-
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import statsmodels.api as sm
 import statsmodels.formula.api as smf
 from scipy import stats
-from scipy.special import expit
 
 SEASONS = {'winter': 0, 'spring': 1, 'summer': 2, 'fall': 3}
 SEASON_ABBR = ['Win', 'Spr', 'Sum', 'Fall']
@@ -200,30 +182,6 @@ def depth_means(fit, depths=(1, 2, 3, 4, 5), level=0.95):
     return pd.DataFrame(rows).T.rename_axis('depth')
 
 
-def plot_depth_series(series, title, ylabel='$ per offered customer', colors=None, ax=None):
-    """One line per entry of `series` ({label: table indexed by depth with estimate, ci_low, ci_high}).
-
-    Points are slightly offset so overlapping 95% CIs stay readable.
-    """
-    ax = ax or plt.subplots(figsize=(7.5, 3.8))[1]
-    colors = colors or [MUTED, TREATED_C, THIRD_C]
-    offsets = np.linspace(-0.08, 0.08, len(series)) if len(series) > 1 else [0.0]
-    for (label, tab), color, dx in zip(series.items(), colors, offsets):
-        depth = tab.index.to_numpy(dtype=float)
-        est, lo, hi = (tab[c].to_numpy(dtype=float) for c in ('estimate', 'ci_low', 'ci_high'))
-        ax.errorbar(depth + dx, est, yerr=np.vstack([est - lo, hi - est]), fmt='o-', color=color, ms=6, lw=1.5,
-                    elinewidth=2, capsize=0, label=label)
-    depths = list(next(iter(series.values())).index)
-    ax.set_xticks(depths, [f'\\${int(d)} off' for d in depths])
-    ax.set_xlim(min(depths) - 0.4, max(depths) + 0.4)
-    ax.axhline(0, color=AXIS, lw=1, zorder=0)
-    ax.set_xlabel('discount depth')
-    ax.set_ylabel(ylabel.replace('$', '\\$'))
-    ax.set_title(title)
-    ax.legend(loc='upper left')
-    return ax
-
-
 # ==================================================================================================
 # PART 3&4: JOINING & CANCELLATION MODEL
 # ==================================================================================================
@@ -255,29 +213,6 @@ def add_terms_cancel(x):
         x['soc_zero' + s] = x[b].eq(0).astype(int)
     return x
 
-
-def price_checks(formula, data, base):
-    """Three checks on the price terms of `formula`: shape, a change at the cut, and the slope by season."""
-    dummies = fit_logit(formula.replace('price_c + price_sq', 'C(price)'), data)
-    lr, dof = 2 * (dummies.llf - base.llf), dummies.df_model - base.df_model
-    print(f"Price dummies vs quadratic: LR = {lr:.1f} on {dof:.0f} df, p = {stats.chi2.sf(lr, dof):.2f}")
-    linear = fit_logit(formula.replace('price_c + price_sq', 'price_c'), data)
-    print(f"Quadratic vs straight line: LR = {2 * (base.llf - linear.llf):.1f} on 1 df")
-    at_cut = fit_logit(formula.replace('price_sq', 'price_sq + price_post'),
-                       data.assign(price_post=data['price_c'] * data['post']))
-    print(f"Separate slope after the cut: {at_cut.params['price_post']:+.3f}, LR = {2 * (at_cut.llf - base.llf):.1f} on 1 df")
-    seasons = sorted(data['t'].unique())
-    slope_terms = [f'price_t{k}' for k in seasons]
-    by_season = data.assign(**{f'price_t{k}': data['price_c'] * data['t'].eq(k) for k in seasons})
-    fit_s = fit_logit(formula.replace('price_c', ' + '.join(slope_terms), 1), by_season)
-    return pd.Series(fit_s.params[slope_terms].to_numpy(), index=[period_label(k) for k in seasons], name='slope at $10')
-
-
-def coef_table_logit(model, terms):
-    """Estimate, CI and p-value for the given terms of a logit (Parts 3 and 4). Separate name: coef_table is Part 1's."""
-    ci = model.conf_int()
-    return pd.DataFrame({'estimate': model.params[terms], 'ci_low': ci.loc[terms, 0], 'ci_high': ci.loc[terms, 1],
-                         'p_value': model.pvalues[terms]}).round(4)
 
 def match_season(target, candidates, log_spend):
     """The candidate season whose planned podcast and social spend (in logs) is closest to the target season's."""

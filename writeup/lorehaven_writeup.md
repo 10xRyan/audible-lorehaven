@@ -6,7 +6,7 @@
 
 3. **What should pricing look like going forward?** Keep the \$12 base, give offered prospects \$5 off their first season, and replace today's random \$1 to \$5 member discount with a flat \$1. My forecast tool puts this 13.7% above today's policy in revenue per customer over the next four seasons, and it stays the best option under 2017, 2018 and 2019 advertising.
 
-## What the data told me about how to analyze it
+## How data informed my analysis
 
 - **There is only one control region.** Panem never cut its price, so a difference-in-differences rests on one region, and Panem moved on its own. I ran the DiD, then built a second estimate that does not use Panem.
 - **Only the size of a discount is random.** A business rule decides who gets an offer; the \$1 to \$5 depth is then randomized, so comparisons across depths are causal. "No offer" and full price are one-dollar extrapolations.
@@ -18,7 +18,7 @@
 
 ### *The price cut*
 
-Against Panem, the cut raised membership by 11.5 points (95% CI 8.5 to 14.5). Revenue is less clear. In dollars the DiD gives +\$0.37 per customer per season (CI 0.07 to 0.66), but in percent it gives +1.5% (CI −16% to +19%).
+Against Panem, the cut raised membership by 11.5 points (95% CI 8.5 to 14.5). Revenue is less clear. In dollars the DiD gives +\$0.37 per customer per season (CI 0.07 to 0.66), but in percent it gives +1.5% (CI −14% to +20%).
 
 The second estimate replays the cut regions through 2019 at \$12 and at \$15 with the joining and cancellation models. At \$12 it matches actual member share within half a point and revenue within \$0.03 per customer. The cut costs \$0.06 per customer in its first season, while existing members pay \$3 less and new ones build up, then adds \$0.67 in each of the next two. Membership rises 10.4 points, close to the DiD. Panem, which neither model saw, tracks the no-cut path.
 

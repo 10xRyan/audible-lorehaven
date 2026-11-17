@@ -1,32 +1,7 @@
-# Lorehaven pricing analysis and simulation tool
-# Everything needed to run the analysis, the app and the tests.
-# Python 3.11+
-#
-# ~= allows minor and bug-fix updates but blocks breaking major versions.
-# For an exact environment, install from requirements.lock.txt (see README).
-
-# Data handling
-pandas~=2.2
 numpy~=2.0
-
-# Estimation
-statsmodels~=0.14      # sign-up and churn logits; DiD/event study via OLS with region and season fixed effects
-scikit-learn~=1.5      # shallow decision tree to recover the eligibility rule; eligibility model
-
-# Input validation
-pandera~=0.20          # schema checks on the three input CSVs (fails loudly on a non-CSV file)
-pydantic~=2.8          # validate the parameters file and the tool's inputs
-
-# Visualization
-matplotlib~=3.9        # static figures for the write-up
-altair~=5.4            # charts in the app (also installed with Streamlit)
-
-# Tool
-streamlit~=1.40
-
-# Tests
-pytest~=8.3
-hypothesis~=6.100      # property tests, e.g. a deeper discount never lowers sign-ups
-
-# Optional: add only if needed
-# pyfixest~=0.28       # customer fixed effects or wild cluster bootstrap with few regions
+statsmodels~=0.14
+scipy~=1.13
+matplotlib~=3.9
+jinja2~=3.1
+ipykernel>=6.29
+pandas~=2.2

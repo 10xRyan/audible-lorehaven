@@ -4,6 +4,17 @@ Forecasts revenue per customer and member count for the next four seasons under 
 it with today's policy (a random $1–$5 off, re-drawn every season). It uses the joining model from Part 3 and the
 cancellation model from Part 4. Nothing is fitted in the tool.
 
+## Setup
+
+From the repo root:
+
+```bash
+pip install -r requirements.txt
+```
+
+Then put the three data files in `data/`: `customer_panel.csv`, `aggregate.csv` and `customer_propensities.csv`.
+They are not in the repository as they are too large to be uploaded. The tool reads the first two; the third is used only by `analysis/00_EDA.ipynb`.
+
 ## Running it
 
 Set `BASE_PRICE`, `JOINING_DISCOUNT`, `SHARE_OFFERED`, `MEMBER_DISCOUNT` and `AD_BACKDROP` in the first code cell
@@ -75,10 +86,9 @@ The price-dependent parts of both models, looked up once for every price the too
 | `tenure[g−1]` | cancelling, tenure group g (1 … 8+) | `C(tenure_group)[T.g]`, 0 for group 1 |
 | `offer` | joining, being offered at all | `offer` coefficient |
 
-Coefficients are read **by name**, so their order in the CSV doesn't matter, and a renamed term raises a
+Coefficients are read **by name** saved as index, so their order in the CSV doesn't matter, and a renamed term raises a
 `KeyError`. **The $12 centring is written out here and also in `utils.py`.** If the models are refitted with a
-different centring, change both, or the tool keeps running with wrong numbers and no error (this happened once,
-when the models moved from $10 to $12).
+different centring, change both, or the tool keeps running with wrong numbers and no error.
 
 ## `prepare(ctx, ad_seasons)`: everything that doesn't depend on price
 
@@ -106,8 +116,7 @@ when the models moved from $10 to $12).
 | `tenure` | one value per customer | consecutive seasons as a member, capped at 8 (the model's 8+ group) |
 | `last_price` | one value per customer | price paid in fall 2019 |
 
-**Extend it here** when a new model variable depends on the customer but not on the price (for example age or
-device): add the column in `load_seasons()`, build its term in `utils.add_terms_*`, and add the term name to
+**Extend it here** when a new model variable depends on the customer but not on the price (for example device): add the column in `load_seasons()`, build its term in `utils.add_terms_*`, and add the term name to
 `JOIN_EXPOSURE` / `CANCEL_EXPOSURE` (or score it alongside them). Nothing in `forecast()` changes.
 
 ## `forecast(ctx, inp, policies)`: the season-by-season roll
@@ -118,20 +127,12 @@ device): add the column in `load_seasons()`, build its term in `utils.add_terms_
 - `members[(tenure, last_price)][i]`: the chance they are a member with that tenure who paid that price last season.
 
 Tenure and last price are tracked because the cancellation model uses both, and under today's random policy
-members differ in their last price. `members` is a `defaultdict`, so a state only exists once someone can be in it.
-In fall 2019 every customer is certain: members put 1.0 in their own state, non-members have `non_member = 1`.
+members differ in their last price.
 
 **Each season**, with that season's setting:
 
-1. **Members stay or cancel.** For every state and every member discount in the setting (each with weight
-   `1 / len(member_depths)`):
-   `log_odds = cancel_index[season] + tenure[tenure−1] + lag[last_price] + cancel[current_price]`.
-   Stayers move to `(min(tenure+1, 8), current_price)` and pay `current_price`; cancellers pay nothing.
-2. **Non-members join.** `offers` lists each group: `offer_rate` split evenly across the joining discounts, and
-   the rest at the base price with `offered = 0`. For each:
-   `log_odds = join_index[season] + join[current_price] + offer·offered`, and
-   `new_joiners = non_member × share × p_join`. Joiners start at `(1, current_price)` and pay `current_price`.
-   Multiplying by `non_member` is what keeps current members from "joining".
+1. **Members stay or cancel.**
+2. **Non-members join.**
 3. **Update.** `non_member = non_member − joined + cancelled`, so people who cancel can rejoin from the next
    season, through the same joining model. `members = next_members`.
 4. **Record** expected members, joins, cancels and revenue, summed over customers.
@@ -139,9 +140,8 @@ In fall 2019 every customer is certain: members put 1.0 in their own state, non-
 **Out:** one row per season with `members`, `joined`, `cancelled`, `revenue` and `revenue per customer`.
 `summarize()` turns it into the four-season totals the reports use.
 
-**Extend it here** when something changes as the forecast runs, like tenure does: add it to the state key
-(`(tenure, last_price, new_thing)`), say how it moves each season in steps 1–2, and add its effect to the log-odds.
-This is the most work, and each new dimension multiplies the number of states.
+**Extend it here** when something changes as the forecast runs, like adding new features and they changed over time: add it to the state key
+(`(tenure, last_price, new_feature)`), say how it moves each season in steps 1–2, and add its effect to the log-odds.
 
 ## Common changes, and where they go
 
@@ -151,24 +151,7 @@ This is the most work, and each new dimension multiplies the number of states.
 | Today's policy changes | `TODAY_OFFER_RATE` and `TODAY_DEPTHS` |
 | A setting that changes by season | Pass a different `policy()` per season to `forecast()`; add the inputs in `run()` |
 | Unequal discount weights | Replace the equal weights in `forecast()` (`discount_weight`, and `share` in `offers`) with weights from the setting |
-| Targeted offers by customer | Make `share` in `offers` a per-customer array. Offers were only ever given by a business rule, so add a caution |
 | New price-only model term | `price_effects()`, then use it in `forecast()` |
 | New customer-level model term | `load_seasons()`, `utils.add_terms_*`, and the term lists `prepare()` scores |
 | New term that changes over time | The state key in `forecast()` |
-| New output | A function in `tools_utils.py`, called from a one-line notebook cell |
 | Ad-spend scenarios | Not possible with these models: exposure wasn't randomized |
-
-## Checks after a change
-
-1. The notebook runs top to bottom.
-2. First-season join and cancel probabilities match the models scored directly with `utils.add_terms_*`.
-3. With a single discount for joiners and members, results match the previous version exactly.
-4. The headline for $5 to join and $1 for members stays at $15.75 per customer (+13.7%) with the 2019 backdrop.
-
-These would make good pytest tests.
-
-## Known limitations
-
-- No new customers arrive, and Panem is excluded because its price never varied.
-- Customers are lined up by position across seasons. This works because every customer appears in every season;
-  a data drop with missing customer-seasons would break it silently.

@@ -4,6 +4,7 @@ The exposure terms are built by utils.add_terms_join and utils.add_terms_cancel,
 fitted with. The price terms are written out in `price_effects`: prices are centred at the $12 base, as in Parts 3
 and 4, so if that centring ever changes in utils.py it must change there too.
 """
+import numbers
 from collections import defaultdict
 
 import matplotlib.pyplot as plt
@@ -251,8 +252,19 @@ def summarize(run):
 # ---------------------------------------------------------------- the notebook's outputs
 def run(ctx, base, join_discount, share_offered, member_discount):
     """Check the choices, forecast them, and print the headline against today's policy."""
+    # Types first: the range checks below can't compare text or None with numbers, and prices are looked up by
+    # whole dollar, so $2.50 off has no entry.
+    is_number = lambda x: isinstance(x, numbers.Real) and not isinstance(x, bool)
+    problems = [f'{name} must be a whole number of dollars (got {value!r}).'
+                for name, value in [('BASE_PRICE', base), ('JOINING_DISCOUNT', join_discount),
+                                    ('MEMBER_DISCOUNT', member_discount)]
+                if not (is_number(value) and float(value).is_integer())]
+    if not is_number(share_offered): problems.append(f'SHARE_OFFERED must be a number from 0 to 100 (got {share_offered!r}).')
+    if problems:
+        raise ValueError('Please change the pricing choices at the top:\n  ' + '\n  '.join(problems))
+    base, join_discount, member_discount = int(base), int(join_discount), int(member_discount)
+
     join_price, member_price = base - join_discount, base - member_discount
-    problems = []
     if not 10 <= base <= 15: problems.append('BASE_PRICE must be between 10 and 15.')
     if not 0 <= join_discount <= 5: problems.append('JOINING_DISCOUNT must be between 0 and 5.')
     if not 0 <= member_discount <= 5: problems.append('MEMBER_DISCOUNT must be between 0 and 5.')
@@ -281,6 +293,8 @@ def run(ctx, base, join_discount, share_offered, member_discount):
 
     notes = []
     if member_price >= 15: notes.append('No member has ever been charged $15, so the member side goes one dollar beyond the data.')
+    elif member_discount == 0: notes.append('Every member has always had a discount. Charging members the full base price assumes they respond to the price alone.')
+    if 0 < share_offered < 1: notes.append(f'SHARE_OFFERED is a percentage, so {share_offered} means {share_offered}% of non-members. For a quarter of them, enter 25.')
     if base < 12: notes.append('The base price has never been below $12. Prices this low were only seen as discounts, so treat this as rougher.')
     if share_offered > 50: notes.append('Offers have only ever gone to about a quarter of non-members. This assumes the rest would respond the same way.')
     if notes:
